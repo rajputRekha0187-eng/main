@@ -1,6 +1,5 @@
 import smtplib
 from email.message import EmailMessage
-
 import os, io, json, random, time, subprocess
 from datetime import datetime, timedelta
 from dateutil import tz
@@ -33,6 +32,7 @@ SAFE_MAX_SCHEDULE = 10
 SLEEP_24H = 24.1 * 3600
 
 WATERMARK = "@ArtWeaver"
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 # =========================================================
 # AUTH
@@ -90,7 +90,7 @@ Status: SAFE – YouTube scheduling limit respected
         s.send_message(msg)
 
 # =========================================================
-# TITLE GENERATOR (UNCHANGED)
+# TITLE GENERATOR
 # =========================================================
 
 def get_random_title():
@@ -127,21 +127,30 @@ def get_random_title():
         return f"ASMR: {random.choice(actions)} {random.choice(mediums)} ({random.choice(adjectives)}) {random.choice(emojis)}"
 
 # =========================================================
-# TAGS + DESCRIPTION (UNCHANGED)
+# TAGS + DESCRIPTION
 # =========================================================
 
 TAG_POOL = [
-    "ArtCraft","Art","Craft","DIY","Drawing","Painting","Sketching","How to draw","Tutorial",
-    "Artist","Creative","Handmade","Paper craft","Origami","Acrylic painting","Watercolor",
-    "Digital art","Speedpaint","Satisfying art","Art hacks","DIY hacks","Easy drawing",
-    "Anime drawing","Realistic drawing","3D art","Optical illusion","Calligraphy","Mandala",
-    "Graffiti","Street art","Fluid art","Resin art","Clay art","Canvas painting","Pencil sketch",
-    "Markers","Procreate","Art vlog","Viral art","Trending art","ASMR art","Aesthetic",
-    "Miniature","Doodle","Zentangle","Abstract art","Modern art","Sculpture","Pottery",
-    "Home decor DIY","Art challenge","Inspiration","Motivation"
+"ArtCraft","Art","Craft","DIY","Drawing","Painting","Sketching","How to draw","Tutorial",
+"Artist","Creative","Handmade","Paper craft","Origami","Acrylic painting","Watercolor",
+"Digital art","Speedpaint","Satisfying art","Art hacks","DIY hacks","Easy drawing",
+"Anime drawing","Realistic drawing","3D art","Optical illusion","Calligraphy","Mandala",
+"Graffiti","Street art","Fluid art","Resin art","Clay art","Canvas painting","Pencil sketch",
+"Markers","Procreate","Art vlog","Viral art","Trending art","ASMR art","Aesthetic",
+"Miniature","Doodle","Zentangle","Abstract art","Modern art","Sculpture","Pottery",
+"Home decor DIY","Art challenge","Inspiration","Motivation"
 ]
 
-FIXED_DESCRIPTION = """<YOUR FULL DESCRIPTION – UNCHANGED>"""
+FIXED_DESCRIPTION = """Disclaimer: - Copyright Disclaimer under section 107 of the Copyright Act 1976. allowance is made for "fair use" for purposes such as criticism. Comment. News. reporting. Teaching. Scholarship . and research. Fair use is a use permitted by copy status that might otherwise be infringing Non-profit. Educational or per Sonal use tips the balance in favor
+
+ArtCraft.
+#bayshotyt #freefire #foryou #freefireconta #spas12 #aimbotfreefire #hackfreefire #sho
+They think I'm an Emulatortgunhandcam
+#shotgun #x1freefire #freefirebrasil #freefireclipes #melhoresmomentos #handcam #loud
+a01,a11,a10,a20,a30,50,a70,a80, iphone,
+#freefire #freefirehighlights #equipou #habash #bestplayer #m1014 #spas12 #dpifreefire #contarara #bestmoments #Iphonefreefire #androidfreefire #equipou ,
+blackn444, bak, loud, ph, movimentação, como subir capa, como colocar gel rápido, free fire pro,pro player, ff, higlight, piuzinho, el gato, sansung a10, jogando no a10, jogador mestre, mobile nivel emulador, level up, nobru, como subir capa, mobile, kauan vm, kauan free fire, menino capudo, revelacao mobile, free fire argentina, free fire Tailândia, free fire, heróico, mastro, mestre, x1 dos youtubers free fire
+"""
 
 # =========================================================
 # HELPERS
@@ -160,10 +169,6 @@ def download(fid, path):
     done = False
     while not done:
         _, done = dl.next_chunk()
-
-# =========================================================
-# AUTO DETECT REMAINING SLOTS (SAFE)
-# =========================================================
 
 def remaining_schedule_slots():
     try:
@@ -189,7 +194,10 @@ state_file = list_files(STATE_FOLDER)[0]["id"]
 
 buf = io.BytesIO()
 MediaIoBaseDownload(buf, drive.files().get_media(fileId=state_file)).next_chunk()
-processed = set(json.loads(buf.getvalue()))
+try:
+    processed = set(json.loads(buf.getvalue()))
+except:
+    processed = set()
 
 videos = sorted(list_files(VIDEO_FOLDER), key=lambda x: x["name"])
 audios = list_files(AUDIO_FOLDER)
@@ -205,6 +213,7 @@ limit = remaining_schedule_slots()
 for v in videos:
     if v["id"] in processed:
         continue
+
     if batch_count >= limit:
         send_report_email(batch_no, report_rows, limit)
         batch_no += 1
@@ -218,7 +227,6 @@ for v in videos:
         uploaded_today = 0
 
     publish_at = schedule_day.replace(hour=TIME_SLOTS[uploaded_today])
-
     title = get_random_title()
 
     vid = f"/tmp/{v['name']}"
@@ -233,7 +241,7 @@ for v in videos:
         "ffmpeg","-y","-i",vid,"-i",aud_p,
         "-filter_complex",
         f"[0:a]volume=0[a0];[1:a]volume={random.uniform(0.4,0.5)}[a1];"
-        f"[0:v]drawtext=text='{WATERMARK}':x=10:y=10:fontsize=24:fontcolor=white@0.4[v]",
+        f"[0:v]drawtext=fontfile={FONT_PATH}:text='{WATERMARK}':x=10:y=10:fontsize=24:fontcolor=white@0.4[v]",
         "-map","[v]","-map","[a1]","-shortest",out
     ], check=True)
 
@@ -267,7 +275,9 @@ for v in videos:
         )
     ).execute()
 
-    os.remove(vid); os.remove(aud_p); os.remove(out)
+    os.remove(vid)
+    os.remove(aud_p)
+    os.remove(out)
 
     uploaded_today += 1
     batch_count += 1
