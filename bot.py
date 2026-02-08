@@ -1,11 +1,12 @@
 import smtplib
 from email.message import EmailMessage
-import os, io, json, random, time, subprocess
+import os, io, json, random, time, subprocess, re
 from datetime import datetime, timedelta
 from dateutil import tz
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.errors import HttpError
 from google.oauth2.service_account import Credentials
 from google.oauth2.credentials import Credentials as UserCreds
 
@@ -24,7 +25,7 @@ STATE_FOLDER = os.environ["STATE_FOLDER_ID"]
 TZ = tz.gettz(os.environ["CHANNEL_TIMEZONE"])
 
 START_DATE = datetime(2026, 2, 10, 8, 0, tzinfo=TZ)
-TIME_SLOTS = [8, 12, 16]   # STRICT 3 PER DAY
+TIME_SLOTS = [8, 12, 16]       # STRICT 3 PER DAY
 MAX_PER_DAY = 3
 SAFE_MAX_SCHEDULE = 10
 SLEEP_24H = 24.1 * 3600
@@ -65,7 +66,7 @@ def send_report_email(batch_no, rows, limit):
     msg.set_content(
         "ART & CRAFT – YOUTUBE REPORT\n\n" +
         "\n".join(rows) +
-        f"\n\nLimit respected: {limit}"
+        f"\n\nSchedule limit respected: {limit}"
     )
 
     with smtplib.SMTP("smtp.gmail.com", 587) as s:
@@ -118,9 +119,17 @@ def download(fid, path):
     while not done:
         _, done = dl.next_chunk()
 
+def numeric_key(name):
+    m = re.search(r"\d+", name)
+    return int(m.group()) if m else 0
+
 def remaining_schedule_slots():
     try:
-        res = youtube.videos().list(part="status", mine=True, maxResults=50).execute()
+        res = youtube.videos().list(
+            part="status",
+            mine=True,
+            maxResults=50
+        ).execute()
         scheduled = sum(
             1 for v in res.get("items", [])
             if v["status"]["privacyStatus"] == "private"
@@ -141,11 +150,31 @@ def save_state(state_id, processed):
         )
     ).execute()
 
+def wait_for_upload_limit_reset():
+    print("⚠️ Upload limit hit. Sleeping 24 hours...")
+    time.sleep(24 * 3600)
+
+    while True:
+        try:
+            youtube.videos().list(
+                part="status",
+                mine=True,
+                maxResults=1
+            ).execute()
+            print("✅ Upload limit reset. Resuming.")
+            return
+        except HttpError as e:
+            if "uploadLimitExceeded" in str(e):
+                print("⏳ Still limited. Checking again in 20 minutes...")
+                time.sleep(20 * 60)
+            else:
+                raise
+
 # =========================================================
 # MAIN
 # =========================================================
 
-# LOAD STATE (MUST BE [])
+# LOAD STATE (processed.json MUST BE [])
 state_file = list_files(STATE_FOLDER)[0]["id"]
 buf = io.BytesIO()
 MediaIoBaseDownload(buf, drive.files().get_media(fileId=state_file)).next_chunk()
@@ -155,7 +184,10 @@ try:
 except:
     processed = set()
 
-videos = sorted(list_files(VIDEO_FOLDER), key=lambda x: x["name"])
+videos = sorted(
+    list_files(VIDEO_FOLDER),
+    key=lambda x: numeric_key(x["name"])
+)
 audios = list_files(AUDIO_FOLDER)
 
 schedule_day = START_DATE
@@ -190,10 +222,12 @@ for v in videos:
     aud_p = f"/tmp/{aud['name']}"
     out = f"/tmp/out_{v['name']}"
 
+    print(f"🎬 Processing {v['name']} → {publish_at}")
+
     download(v["id"], vid)
     download(aud["id"], aud_p)
 
-    # 🔐 MARK AS PROCESSED BEFORE UPLOAD (CRASH SAFE)
+    # MARK AS PROCESSED BEFORE UPLOAD (CRASH SAFE)
     processed.add(v["id"])
     save_state(state_file, processed)
 
@@ -209,26 +243,32 @@ for v in videos:
         "-shortest", out
     ], check=True)
 
-    youtube.videos().insert(
-        part="snippet,status",
-        body={
-            "snippet":{
-                "title": title,
-                "description": FIXED_DESCRIPTION,
-                "tags": random.sample(TAG_POOL, 5),
-                "categoryId":"26"
-            },
-            "status":{
-                "privacyStatus":"private",
-                "publishAt": publish_at.isoformat()
-            }
-        },
-        media_body=MediaFileUpload(out)
-    ).execute()
+    while True:
+        try:
+            youtube.videos().insert(
+                part="snippet,status",
+                body={
+                    "snippet":{
+                        "title": title,
+                        "description": FIXED_DESCRIPTION,
+                        "tags": random.sample(TAG_POOL, 5),
+                        "categoryId":"26"
+                    },
+                    "status":{
+                        "privacyStatus":"private",
+                        "publishAt": publish_at.isoformat()
+                    }
+                },
+                media_body=MediaFileUpload(out)
+            ).execute()
+            break
+        except HttpError as e:
+            if "uploadLimitExceeded" in str(e):
+                wait_for_upload_limit_reset()
+            else:
+                raise
 
-    report_rows.append(
-        f"{v['name']} → {publish_at}"
-    )
+    report_rows.append(f"{v['name']} → {publish_at}")
 
     os.remove(vid)
     os.remove(aud_p)
@@ -238,13 +278,8 @@ for v in videos:
     batch_count += 1
     time.sleep(random.randint(60,120))
 
-# =========================================================
-# FINAL REPORT (CRITICAL FIX)
-# =========================================================
-
+# FINAL REPORT (ALWAYS SEND)
 if report_rows:
     send_report_email(batch_no, report_rows, limit)
 
-
 print("AUTOMATION RUNNING – SAFE MODE ✅")
-
