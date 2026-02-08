@@ -238,11 +238,17 @@ for v in videos:
     download(aud["id"], aud_p)
 
     subprocess.run([
-        "ffmpeg","-y","-i",vid,"-i",aud_p,
+        "ffmpeg", "-y",
+        "-i", vid,
+        "-i", aud_p,
         "-filter_complex",
-        f"[0:a]volume=0[a0];[1:a]volume={random.uniform(0.4,0.5)}[a1];"
-        f"[0:v]drawtext=fontfile={FONT_PATH}:text='{WATERMARK}':x=10:y=10:fontsize=24:fontcolor=white@0.4[v]",
-        "-map","[v]","-map","[a1]","-shortest",out
+        f"[1:a]volume={random.uniform(0.4,0.5)}[bg];"
+        f"[0:v]drawtext=fontfile={FONT_PATH}:"
+        f"text='{WATERMARK}':x=10:y=10:fontsize=24:fontcolor=white@0.4[v]",
+        "-map", "[v]",
+        "-map", "[bg]",
+        "-shortest",
+        out
     ], check=True)
 
     youtube.videos().insert(
