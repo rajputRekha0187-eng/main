@@ -238,4 +238,13 @@ for v in videos:
     batch_count += 1
     time.sleep(random.randint(60,120))
 
+# =========================================================
+# FINAL REPORT (CRITICAL FIX)
+# =========================================================
+
+if report_rows:
+    send_report_email(batch_no, report_rows, limit)
+
+
 print("AUTOMATION RUNNING – SAFE MODE ✅")
+
