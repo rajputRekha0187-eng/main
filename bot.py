@@ -25,7 +25,7 @@ VIDEO_FOLDER_ID = os.environ["VIDEO_FOLDER_ID"]
 AUDIO_FOLDER_ID = os.environ["AUDIO_FOLDER_ID"]
 STATE_FILE_ID   = os.environ["STATE_FOLDER_ID"]
 
-TOTAL_VIDEOS = int(os.environ["TOTAL_VIDEOS"])
+TOTAL_VIDEOS = int(os.environ.get("TOTAL_VIDEOS", "0"))
 
 TZ = tz.gettz(os.environ["CHANNEL_TIMEZONE"])
 
@@ -33,14 +33,16 @@ START_DATE = datetime(2026, 2, 10, 8, 0, tzinfo=TZ)
 TIME_SLOTS = [8, 12, 16]
 MAX_PER_DAY = 3
 
-MIN_REQUIRED_SLOTS = 10
+BATCH_SIZE = 10
 SLEEP_24H = 24.1 * 3600
 RECHECK_20_MIN = 20 * 60
 
 WATERMARK = "@ArtWeaver"
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+SAFE_WATERMARK = WATERMARK.replace("'", "\\'")
 
-BASE_DESCRIPTION = """Disclaimer: - Copyright Disclaimer under section 107 of the Copyright Act 1976. allowance is made for "fair use" for purposes such as criticism, comment, news reporting, teaching, scholarship, and research.
+BASE_DESCRIPTION = """Disclaimer: Copyright Disclaimer under section 107 of the Copyright Act 1976.
+Fair use is permitted for criticism, comment, news reporting, teaching, scholarship and research.
 
 ArtCraft.
 """
@@ -70,8 +72,15 @@ def tg(msg):
         if c.strip():
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": c.strip(), "text": msg, "parse_mode": "HTML"}
+                json={"chat_id": c.strip(), "text": msg, "parse_mode": "HTML"},
+                timeout=10
             )
+
+def progress_bar(done, total, size=20):
+    if total <= 0:
+        return "?"
+    filled = int(size * done / total)
+    return "█" * filled + "░" * (size - filled)
 
 def poll_commands(last_processed):
     global PAUSED, FORCE_WAKE, LAST_UPDATE_ID
@@ -101,7 +110,7 @@ def poll_commands(last_processed):
 
         elif text == "/wake":
             FORCE_WAKE = True
-            tg("⏰ <b>Wake signal received</b>")
+            tg("⏰ <b>Wake requested</b>")
 
         elif text == "/status":
             bar = progress_bar(last_processed, TOTAL_VIDEOS)
@@ -111,10 +120,6 @@ def poll_commands(last_processed):
                 f"{last_processed} / {TOTAL_VIDEOS}\n"
                 f"Paused: {PAUSED}"
             )
-
-def progress_bar(done, total, size=20):
-    filled = int(size * done / total)
-    return "█" * filled + "░" * (size - filled)
 
 # =========================================================
 # AUTH
@@ -171,50 +176,42 @@ def list_audios():
         fields="files(id,name)"
     ).execute()["files"]
 
-def remaining_slots():
-    search = youtube.search().list(
-        part="id",
-        forMine=True,
-        type="video",
-        maxResults=50
-    ).execute()
+def download(file_id, path):
+    req = drive.files().get_media(fileId=file_id)
+    with open(path, "wb") as f:
+        dl = MediaIoBaseDownload(f, req)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
 
-    ids = [i["id"]["videoId"] for i in search.get("items", [])]
-    if not ids:
-        return MIN_REQUIRED_SLOTS
+def random_title():
+    return random.choice([
+        "Oddly Satisfying Art ✨",
+        "Trust the process 👀",
+        "ASMR Art 🎨",
+        "Rate this 1–10 😱",
+        "Relaxing Craft Process 🖌️"
+    ])
 
-    vids = youtube.videos().list(
-        part="status",
-        id=",".join(ids)
-    ).execute()
-
-    scheduled = sum(
-        1 for v in vids["items"]
-        if v["status"]["privacyStatus"] == "private"
-        and v["status"].get("publishAt")
-    )
-
-    return max(0, MIN_REQUIRED_SLOTS - scheduled)
-
-def wait_for_slots(last_processed):
+def wait_for_upload_limit(last_processed):
     global FORCE_WAKE
-    tg("⛔ <b>Upload limit reached</b>\n😴 Sleeping 24.1h")
+    tg("⛔ <b>Upload limit reached</b>\n😴 Sleeping 24.1 hours")
 
     slept = 0
     while slept < SLEEP_24H:
         poll_commands(last_processed)
         if FORCE_WAKE:
             FORCE_WAKE = False
-            break
+            tg("⏰ <b>Wake forced — retrying</b>")
+            return
         time.sleep(60)
         slept += 60
 
+    tg("🔁 <b>Retrying every 20 minutes</b>")
     while True:
         poll_commands(last_processed)
-        if remaining_slots() >= MIN_REQUIRED_SLOTS:
-            tg("✅ <b>Slots available</b>\n🚀 Resuming")
-            return
         time.sleep(RECHECK_20_MIN)
+        return
 
 # =========================================================
 # MAIN
@@ -244,24 +241,14 @@ while True:
         tg("🏁 <b>All videos completed</b>")
         break
 
-    while remaining_slots() < MIN_REQUIRED_SLOTS:
-        wait_for_slots(last_processed)
-
     if uploaded_today >= MAX_PER_DAY:
         schedule_day += timedelta(days=1)
         uploaded_today = 0
 
     publish_at = schedule_day.replace(hour=TIME_SLOTS[uploaded_today])
 
-    title = random.choice([
-        "Oddly Satisfying Art ✨",
-        "Trust the process 👀",
-        "ASMR Art 🎨",
-        "Rate this 1–10 😱",
-        "Relaxing Craft Process 🖌️"
-    ])
-
-    tags = random.sample(TAG_POOL, 10)
+    title = random_title()
+    tags = random.sample(TAG_POOL, min(10, len(TAG_POOL)))
     description = f"{title}\n\n{BASE_DESCRIPTION}\n\n{', '.join(tags)}"
 
     save_state(next_num)
@@ -273,14 +260,16 @@ while True:
     aud_p = f"/tmp/{aud['name']}"
     out = f"/tmp/out_{fname}"
 
-    MediaIoBaseDownload(open(vid, "wb"), drive.files().get_media(fileId=file["id"])).next_chunk()
-    MediaIoBaseDownload(open(aud_p, "wb"), drive.files().get_media(fileId=aud["id"])).next_chunk()
+    download(file["id"], vid)
+    download(aud["id"], aud_p)
 
     subprocess.run([
-        "ffmpeg","-y","-i",vid,"-i",aud_p,
+        "ffmpeg","-y",
+        "-i",vid,"-i",aud_p,
         "-filter_complex",
         f"[1:a]volume=0.45[bg];"
-        f"[0:v]drawtext=fontfile={FONT_PATH}:text='{WATERMARK}':x=10:y=10:fontsize=24:fontcolor=white@0.4[v]",
+        f"[0:v]drawtext=fontfile={FONT_PATH}:"
+        f"text='{SAFE_WATERMARK}':x=10:y=10:fontsize=24:fontcolor=white@0.4[v]",
         "-map","[v]","-map","[bg]","-shortest",out
     ], check=True)
 
@@ -305,7 +294,7 @@ while True:
             break
         except HttpError as e:
             if "uploadLimitExceeded" in str(e):
-                wait_for_slots(last_processed)
+                wait_for_upload_limit(last_processed)
             else:
                 raise
 
@@ -323,7 +312,7 @@ while True:
     uploaded_today += 1
     time.sleep(random.randint(60,120))
 
-    if batch_counter >= MIN_REQUIRED_SLOTS:
+    if batch_counter >= BATCH_SIZE:
         bar = progress_bar(last_processed, TOTAL_VIDEOS)
         tg(
             f"📦 <b>Batch completed</b>\n\n"
@@ -331,3 +320,5 @@ while True:
             f"{last_processed} / {TOTAL_VIDEOS}"
         )
         batch_counter = 0
+
+tg("🏁 <b>Automation finished safely</b>")
