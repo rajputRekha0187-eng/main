@@ -1,9 +1,9 @@
-import smtplib
-from email.message import EmailMessage
-import os, io, json, random, time, subprocess, re
+import os, io, json, time, random, subprocess, requests
 from datetime import datetime, timedelta
 from dateutil import tz
-import requests
+
+import smtplib
+from email.message import EmailMessage
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload, MediaIoBaseUpload
@@ -22,40 +22,105 @@ EMAIL_PASS = os.environ["REPORT_EMAIL_PASSWORD"]
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHATS = os.environ.get("TELEGRAM_CHAT_ID", "").split(",")
 
-VIDEO_FOLDER = os.environ["VIDEO_FOLDER_ID"]
-AUDIO_FOLDER = os.environ["AUDIO_FOLDER_ID"]
-STATE_FOLDER = os.environ["STATE_FOLDER_ID"]
+VIDEO_FOLDER_ID = os.environ["VIDEO_FOLDER_ID"]
+AUDIO_FOLDER_ID = os.environ["AUDIO_FOLDER_ID"]
+STATE_FILE_ID   = os.environ["STATE_FOLDER_ID"]
+
+TOTAL_VIDEOS = int(os.environ["TOTAL_VIDEOS"])
 
 TZ = tz.gettz(os.environ["CHANNEL_TIMEZONE"])
 
 START_DATE = datetime(2026, 2, 10, 8, 0, tzinfo=TZ)
 TIME_SLOTS = [8, 12, 16]
 MAX_PER_DAY = 3
-SAFE_MAX_SCHEDULE = 10
 
-SLEEP_24H = 24 * 3600
+MIN_REQUIRED_SLOTS = 10
+SLEEP_24H = 24.1 * 3600
 RECHECK_20_MIN = 20 * 60
 
 WATERMARK = "@ArtWeaver"
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 # =========================================================
-# TELEGRAM
+# CONSTANT CONTENT
 # =========================================================
 
-def tg_send(msg):
+BASE_DESCRIPTION = """Disclaimer: - Copyright Disclaimer under section 107 of the Copyright Act 1976. allowance is made for "fair use" for purposes such as criticism. Comment. News. reporting. Teaching. Scholarship . and research. Fair use is a use permitted by copy status that might otherwise be infringing Non-profit. Educational or per Sonal use tips the balance in favor
+
+ArtCraft.
+"""
+
+TAG_POOL = [
+    "ArtCraft","Art","Craft","DIY","Drawing","Painting","Sketching",
+    "Satisfying art","ASMR art","Viral art","Trending art","Creative",
+    "Handmade","Artist","Shorts"
+]
+
+# =========================================================
+# TELEGRAM STATE
+# =========================================================
+
+BOT_STATE = {
+    "paused": False,
+    "force_check": False
+}
+
+# =========================================================
+# TELEGRAM HELPERS
+# =========================================================
+
+def progress_bar(done, total, size=20):
+    filled = int(size * done / total)
+    return "█" * filled + "░" * (size - filled)
+
+def tg_send(text, with_buttons=True):
     if not TELEGRAM_TOKEN:
         return
+
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "▶️ Wake & Check Now", "callback_data": "wake"}],
+            [
+                {"text": "⏸ Pause", "callback_data": "pause"},
+                {"text": "▶️ Resume", "callback_data": "resume"}
+            ],
+            [{"text": "📊 Status", "callback_data": "status"}]
+        ]
+    } if with_buttons else None
+
     for chat in TELEGRAM_CHATS:
-        if chat.strip():
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={
-                    "chat_id": chat.strip(),
-                    "text": msg,
-                    "parse_mode": "HTML"
-                }
-            )
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": chat.strip(),
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": keyboard
+            }
+        )
+
+def poll_telegram():
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        res = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            timeout=10
+        ).json()
+
+        for u in res.get("result", []):
+            if "callback_query" not in u:
+                continue
+
+            data = u["callback_query"]["data"]
+            if data == "pause":
+                BOT_STATE["paused"] = True
+            elif data == "resume":
+                BOT_STATE["paused"] = False
+            elif data == "wake":
+                BOT_STATE["force_check"] = True
+    except:
+        pass
 
 # =========================================================
 # AUTH
@@ -78,138 +143,135 @@ youtube = build(
 )
 
 # =========================================================
-# EMAIL
-# =========================================================
-
-def send_report_email(batch_no, rows):
-    if not rows:
-        return
-
-    msg = EmailMessage()
-    msg["Subject"] = f"ArtCraft Upload Report – Batch {batch_no}"
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-
-    msg.set_content("ART & CRAFT – YOUTUBE REPORT\n\n" + "\n".join(rows))
-
-    with smtplib.SMTP("smtp.gmail.com", 587) as s:
-        s.starttls()
-        s.login(EMAIL_FROM, EMAIL_PASS)
-        s.send_message(msg)
-
-    tg_send(
-        f"📬 <b>Report email sent</b>\n"
-        f"📦 Batch: {batch_no}\n"
-        f"📊 Videos: {len(rows)}"
-    )
-
-# =========================================================
 # HELPERS
 # =========================================================
 
-def list_files(folder):
+def next_filename(n):
+    return f"{n:03d}craft.mp4"
+
+def load_state():
+    buf = io.BytesIO()
+    MediaIoBaseDownload(buf, drive.files().get_media(fileId=STATE_FILE_ID)).next_chunk()
+    return json.loads(buf.getvalue()).get("last_processed", 0)
+
+def save_state(n):
+    data = json.dumps({"last_processed": n}).encode()
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="application/json")
+    drive.files().update(fileId=STATE_FILE_ID, media_body=media).execute()
+
+def find_video(name):
+    res = drive.files().list(
+        q=f"'{VIDEO_FOLDER_ID}' in parents and name='{name}' and trashed=false",
+        fields="files(id,name)",
+        pageSize=1
+    ).execute()
+    return res.get("files", [None])[0]
+
+def list_audios():
     return drive.files().list(
-        q=f"'{folder}' in parents and trashed=false",
+        q=f"'{AUDIO_FOLDER_ID}' in parents and trashed=false",
         fields="files(id,name)"
     ).execute()["files"]
 
 def download(fid, path):
     req = drive.files().get_media(fileId=fid)
-    fh = io.FileIO(path, "wb")
-    dl = MediaIoBaseDownload(fh, req)
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
+    with open(path, "wb") as f:
+        dl = MediaIoBaseDownload(f, req)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
 
-def numeric_key(name):
-    m = re.search(r"\d+", name)
-    return int(m.group()) if m else 0
+def get_random_title():
+    return random.choice([
+        "Oddly Satisfying Art ✨",
+        "Trust the process 👀",
+        "ASMR Art 🎨",
+        "Rate this 1–10 😱",
+        "I tried this art hack 🔥",
+        "Relaxing Craft Process 🖌️"
+    ])
 
-def remaining_schedule_slots():
-    try:
-        res = youtube.videos().list(part="status", mine=True, maxResults=50).execute()
-        scheduled = sum(
-            1 for v in res.get("items", [])
-            if v["status"]["privacyStatus"] == "private"
-            and v["status"].get("publishAt")
-        )
-        return max(0, SAFE_MAX_SCHEDULE - scheduled)
-    except:
-        return SAFE_MAX_SCHEDULE
+def remaining_slots():
+    res = youtube.videos().list(part="status", mine=True, maxResults=50).execute()
+    scheduled = sum(
+        1 for v in res.get("items", [])
+        if v["status"]["privacyStatus"] == "private"
+        and v["status"].get("publishAt")
+    )
+    return max(0, MIN_REQUIRED_SLOTS - scheduled)
 
-def save_state(state_id, processed):
-    data = json.dumps(list(processed)).encode("utf-8")
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="application/json")
-    drive.files().update(fileId=state_id, media_body=media).execute()
+def wait_for_limit_reset():
+    tg_send("⛔ <b>Upload limit reached</b>\n😴 Sleeping 24.1 hours")
 
-def wait_for_upload_limit_reset():
-    tg_send("⛔ <b>Upload limit reached</b>\n😴 Sleeping 24 hours")
-    time.sleep(SLEEP_24H)
+    slept = 0
+    while slept < SLEEP_24H:
+        poll_telegram()
+        if BOT_STATE["force_check"]:
+            BOT_STATE["force_check"] = False
+            break
+        time.sleep(60)
+        slept += 60
 
     while True:
-        try:
-            youtube.videos().list(part="status", mine=True, maxResults=1).execute()
-            tg_send("✅ <b>Upload limit reset</b>\n🚀 Resuming automation")
+        poll_telegram()
+        slots = remaining_slots()
+        if slots >= MIN_REQUIRED_SLOTS:
+            tg_send("✅ <b>Upload slots available</b>\n🚀 Resuming")
             return
-        except HttpError as e:
-            if "uploadLimitExceeded" in str(e):
-                tg_send("⏳ Still limited… checking again in 20 minutes")
-                time.sleep(RECHECK_20_MIN)
-            else:
-                raise
+        time.sleep(RECHECK_20_MIN)
 
 # =========================================================
 # MAIN
 # =========================================================
 
-state_file = list_files(STATE_FOLDER)[0]["id"]
-buf = io.BytesIO()
-MediaIoBaseDownload(buf, drive.files().get_media(fileId=state_file)).next_chunk()
+tg_send("🚀 <b>ArtCraft automation started</b>")
 
-try:
-    processed = set(json.loads(buf.getvalue()))
-except:
-    processed = set()
-
-videos = sorted(list_files(VIDEO_FOLDER), key=lambda x: numeric_key(x["name"]))
-audios = list_files(AUDIO_FOLDER)
+audios = list_audios()
+last_processed = load_state()
 
 schedule_day = START_DATE
 uploaded_today = 0
-batch_no = 1
-report_rows = []
+batch_count = 0
 
-tg_send("🚀 <b>ArtCraft automation started</b>")
+while True:
+    poll_telegram()
+    while BOT_STATE["paused"]:
+        tg_send("⏸ <b>Bot paused</b>", with_buttons=False)
+        time.sleep(60)
+        poll_telegram()
 
-for v in videos:
-    if v["id"] in processed:
-        continue
+    next_num = last_processed + 1
+    fname = next_filename(next_num)
+    file = find_video(fname)
 
-    while remaining_schedule_slots() <= 0:
-        wait_for_upload_limit_reset()
+    if not file:
+        tg_send("🛑 <b>No next video found</b>\nAutomation finished.")
+        break
+
+    while remaining_slots() < MIN_REQUIRED_SLOTS:
+        wait_for_limit_reset()
 
     if uploaded_today >= MAX_PER_DAY:
         schedule_day += timedelta(days=1)
         uploaded_today = 0
 
     publish_at = schedule_day.replace(hour=TIME_SLOTS[uploaded_today])
+    title = get_random_title()
+    tags = random.sample(TAG_POOL, 10)
 
-    tg_send(
-        f"🎬 <b>Processing video</b>\n"
-        f"📄 {v['name']}\n"
-        f"🕒 {publish_at.strftime('%b %d • %H:%M IST')}"
-    )
+    description = f"{title}\n\n{BASE_DESCRIPTION}\n\n{', '.join(tags)}"
 
-    vid = f"/tmp/{v['name']}"
+    save_state(next_num)
+    last_processed = next_num
+    batch_count += 1
+
+    vid = f"/tmp/{fname}"
     aud = random.choice(audios)
     aud_p = f"/tmp/{aud['name']}"
-    out = f"/tmp/out_{v['name']}"
+    out = f"/tmp/out_{fname}"
 
-    download(v["id"], vid)
+    download(file["id"], vid)
     download(aud["id"], aud_p)
-
-    processed.add(v["id"])
-    save_state(state_file, processed)
 
     subprocess.run([
         "ffmpeg","-y","-i",vid,"-i",aud_p,
@@ -226,9 +288,9 @@ for v in videos:
                 part="snippet,status",
                 body={
                     "snippet":{
-                        "title":"Art Shorts",
-                        "description":"ArtCraft",
-                        "tags":["Art","Shorts"],
+                        "title": title,
+                        "description": description,
+                        "tags": tags,
                         "categoryId":"26"
                     },
                     "status":{
@@ -241,12 +303,17 @@ for v in videos:
             break
         except HttpError as e:
             if "uploadLimitExceeded" in str(e):
-                wait_for_upload_limit_reset()
+                wait_for_limit_reset()
             else:
                 raise
 
-    tg_send(f"✅ <b>Uploaded</b>\n🎥 {v['name']}")
-    report_rows.append(f"{v['name']} → {publish_at}")
+    tg_send(
+        f"✅ <b>Video Scheduled</b>\n\n"
+        f"🎥 {fname}\n"
+        f"📝 {title}\n"
+        f"🕒 {publish_at.strftime('%b %d • %H:%M IST')}",
+        with_buttons=False
+    )
 
     os.remove(vid)
     os.remove(aud_p)
@@ -255,5 +322,15 @@ for v in videos:
     uploaded_today += 1
     time.sleep(random.randint(60,120))
 
-send_report_email(batch_no, report_rows)
+    # ===== BATCH END PROGRESS =====
+    if batch_count >= MIN_REQUIRED_SLOTS:
+        bar = progress_bar(last_processed, TOTAL_VIDEOS)
+        tg_send(
+            f"📦 <b>Batch Completed</b>\n\n"
+            f"📊 <b>Progress</b>\n"
+            f"{bar} {last_processed} / {TOTAL_VIDEOS}\n"
+            f"📁 Remaining: {TOTAL_VIDEOS - last_processed}"
+        )
+        batch_count = 0
+
 tg_send("🏁 <b>Automation finished safely</b>")
